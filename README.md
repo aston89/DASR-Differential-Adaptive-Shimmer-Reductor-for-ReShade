@@ -7,6 +7,7 @@
 5. [Known Limitations](#5-known-limitations)
 6. [Recommended Settings and Tuning Philosophy](#6-recommended-settings-and-tuning-philosophy)
 7. [Requirements & Compatibility](#7-requirements--compatibility)
+8. [DASR-Core: A complementary approach](#8-DASR-Core-A-Complementary-Approach)
 
  ---
 
@@ -764,4 +765,84 @@ The recommended workflow is to first test the default configuration in motion, t
 
 ---
 
+# 8. DASR-Core: A Complementary Approach
 
+## 8.1 Why DASR-Core was created
+DASR-Core started with a practical observation: even when a post-process already detects aliasing and applies directional filtering, some of the most distracting artifacts are not perceived as ordinary jagged edges. They appear as thin structures that abruptly change brightness, coverage or colour as the camera moves.
+Examples include distant railway details, freight-train components, wires, narrow edges, bright markings on asphalt and other high-frequency structures. Their visual annoyance comes not only from their spatial shape, but also from how their sampled representation changes between frames.
+The original DASR addresses this problem through a broad detection-and-stabilization pipeline. Core explores a more focused strategy:
+**Use the sampling grid to identify vulnerable regions, temporal matching to estimate plausible local displacement and selective correction to reduce the instability without applying generalized blur.**
+This distinction is important. A pixel changing between two frames is not automatically a problem: genuine geometry, lighting and camera movement all produce legitimate changes. Conversely, waiting for a strict alternating A/B/A pattern is not always necessary to identify an abrupt and visually disturbing transition.
+Core therefore treats spatial sampling risk as a prior signal. Temporal evidence determines whether that risk is currently relevant, while the correction stage decides how strongly to modify the luminance and chrominance components.
+The result is intended to feel less like a conventional smoothing filter and more like a selective control system for unstable fine detail.
+
+## 8.2 Shared foundation: Grid-Brick sampling analysis
+DASR and DASR-Core share the same central intuition: a region can be suspicious when its appearance changes substantially under different spatial sampling arrangements.
+Core builds a compact Grid-Brick signature from three local sampling phases:
+- **Phase A centre and wider cardinal samples:** the centre pixel is combined with cardinal samples at a two-pixel offset.
+- **Phase B near cardinal samples:** the four immediately adjacent pixels form a second estimate.
+- **Phase C diagonal samples:** the four diagonal neighbours form a third estimate.
+The shader compares these phase estimates and calculates a divergence score. If the results differ substantially, the local representation is considered sensitive to sampling position.
+This is not a test for detail alone. A perfectly stable, detailed texture does not necessarily require correction, while a thin line whose sampled coverage changes dramatically can be highly vulnerable.
+The important distinction is how the resulting information is used. The grid does not automatically instruct the shader to blur a pixel. It contributes a measure of spatial risk that must be supported by temporal evidence before the main correction gates become active.
+
+## 8.3 From broad risk fusion to motion-conditioned correction
+The original DASR combines several complementary detectors into a unified risk map:
+- Grid-Brick sampling divergence.
+- Temporal instability with local matching and motion/disocclusion rejection.
+- A dedicated periodicity detector for repeating high-frequency patterns.
+- Depth-based risk weighting.
+The original then uses structural orientation, adaptive filtering parameters and phase-aware temporal analysis to decide how to stabilize the image.
+**Core reorganizes this process around a more direct relationship between grid vulnerability and temporal change**.
+Its main luminance and chrominance correction gates combine Grid-Brick risk with component-specific temporal instability. Temporal changes therefore do not independently trigger the same correction everywhere: they must coincide with a spatially vulnerable region.
+This focused design removes the original's separate periodicity detector and structure-tensor-directed filtering stage. Instead, Core uses a compact Grid-Brick signature, a local temporal signature match and an edge-aware cardinal correction model.
+This is a change in algorithmic emphasis, not a claim that every detector in the original is unnecessary. The original offers a broader set of specialized analysis stages; Core investigates whether a smaller set of tightly coupled signals can produce a more comfortable suppression in difficult scenes.
+
+## 8.4 Local temporal matching and cardinal pseudo-flow
+Core compares the current Grid-Brick signature against signatures stored from the previous frame. A small 3×3 neighbourhood is searched, with a penalty for larger offsets to discourage unnecessary displacement.
+The matching process then evaluates horizontal and vertical hypotheses independently:
+1. It measures whether a horizontal offset improves the signature match.
+2. It separately evaluates the vertical offset.
+3. If both axes are supported, it tests the combined diagonal position.
+4. A diagonal is accepted only when the combined signature supports it; otherwise, the more convincing axis is retained.
+The selected displacement is then checked against raw colour information. The colour comparison, performed in a luminance/chrominance-aware representation, helps distinguish a plausible match from an arbitrary nearby sample.
+Core also checks depth consistency when depth-aware validation is enabled. A mismatch reduces motion confidence instead of automatically invalidating every match, since real movement can include changes in scene depth.
+The result is a **cardinal pseudo-motion vector**, not a true engine motion vector. It represents a plausible local displacement derived from image evidence, with a confidence value indicating how much the correction should trust that estimate.
+Unlike engine-provided motion vectors or hardware optical flow, this method cannot reliably recover complex geometry, deformation or large displacement. Its purpose is narrower: identify credible local movement of sampling-sensitive image structures at low displacement ranges.
+
+## 8.5 Separate luminance and chrominance control
+One of Core's defining differences is its use of separate temporal instability gates for luminance and chrominance.
+The source colour is transformed into YCoCg. Luminance is evaluated independently from the two chrominance components, allowing the shader to respond differently to brightness changes and colour changes.
+**Why does this matter?**
+A thin bright detail can alternate between dark and bright coverage while maintaining a similar hue. A coloured line can exhibit visible chromatic instability without an equally large luminance change. Treating both situations with a single RGB difference threshold would make the response less selective.
+Core therefore calculates separate temporal evidence and applies independent suppression strengths:
+- **Luminance suppression** controls how strongly the luminance component moves toward a local, edge-aware estimate.
+- **Chrominance suppression** controls the correction of the colour components independently.
+- **Edge-aware detail support** reduces reliance on neighbours whose appearance differs strongly from the centre.
+The resulting correction is not a uniform blend between the original image and a blurred frame. It is a channel-wise adjustment toward a weighted local estimate, gated by spatial risk and temporal evidence.
+This also explains why a stronger suppression setting can sometimes make an image *appear* sharper. If the strongest visible distraction comes from unstable bright or coloured samples, suppressing those fluctuations can improve perceived clarity even though the shader is not performing conventional sharpening.
+That is an empirical effect to validate across scenes, not a guarantee that maximum suppression always preserves every legitimate detail.
+
+## 8.6 Outlier repair: suppress isolated transients, not all motion
+Core includes a separate repair path for isolated temporal outliers.
+It compares the current pixel against two preceding raw-colour samples. The temporal pattern helps distinguish a current value that disagrees with both prior frames from a simple alternating phase pattern or continuous temporal change.
+Spatial evidence is then used to determine whether the disagreement is isolated relative to nearby pixels. Neighbour activity, local luminance/chrominance coherence and depth compatibility contribute to that decision.
+Only when these conditions support the outlier hypothesis does the repair blend toward a two-frame historical consensus. This path is explicitly gated by the Grid-Brick signal and the outlier mask.
+Outlier repair is therefore different from the main adaptive correction:
+- The primary correction moves an unstable component toward a local spatial estimate.
+- Outlier repair targets a pixel that behaves like an isolated transient.
+- Both are conditional rather than global.
+This is one reason Core can improve perceived clarity in scenes with unstable fragments or isolated bright samples. It is not sharpening the image; it is reducing anomalous variations that otherwise distract from stable surrounding detail.
+Historical colour is used for this specifically gated repair and for temporal validation. It is **not** used as an unconditional source of colour for the directional bleed.
+
+## 8.7 Motion-conditioned directional bleed
+Core adds an experimental one-pixel directional bleed, driven by the estimated pseudo-flow and its confidence.
+The bleed examines the four cardinal neighbours and weights their contribution according to the neighbour's motion direction and confidence. The current-frame raw colour of those neighbours supplies the bleed colour.
+This is deliberately different from accumulating old colour into a trailing history image. A previous frame can help estimate whether a structure moved, but the bleed itself is sourced from the current image. If a structure disappears and no longer supplies a credible motion signal, old RGB is not retained to paint a lingering tail.
+A short confidence-release mechanism allows some continuity while the structure remains plausible, while the disappearance test suppresses stale motion confidence. Depth compatibility further limits contributions across surface boundaries.
+The bleed is therefore a small, locally conditioned approximation of directional spreading, not a full motion-blur implementation. It cannot recreate the shutter integration of a renderer with accurate motion vectors. Its purpose is to soften abrupt local transitions around selected moving details without applying blur to the entire image.
+This stage is experimental and should remain independently tunable. More bleed is not necessarily better: excessive strength can reduce fine-detail clarity or spread colours inappropriately.
+
+## 8.8 A different use of depth information
+Both implementations can use ReShade depth information, but their depth-aware logic has different emphases.
+The original DASR uses depth as part of risk evaluation and also employs depth-aware weighting in its adaptive spatial filtering. Its goal is to adjust stabilization
